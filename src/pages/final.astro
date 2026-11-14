@@ -1,0 +1,269 @@
+---
+import Base from '../layouts/Base.astro';
+---
+<Base title="Final test">
+  <div id="app"><p class="muted">Loading…</p></div>
+</Base>
+
+<script>
+  import { supabase, path, esc, youtubeEmbed, toast } from '../lib/supabase.js';
+
+  const app = document.getElementById('app')!;
+  const SECTION_TITLES: Record<string, string> = {
+    mcq: 'Section A: Multiple choice',
+    debate: 'Section B: Judge the debate',
+    written: 'Section C: Written answers',
+  };
+  const fmt = (d: string | null) => d ? new Date(d).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—';
+
+  async function load() {
+    if (!supabase) { app.innerHTML = `<h1>Final test</h1><div class="notice notice-warn">The final test needs the site to be connected to Supabase.</div>`; return; }
+    const { data } = await supabase.auth.getSession();
+    const user = data.session?.user;
+    if (!user || user.is_anonymous) return emailForm();
+    await supabase.rpc('merge_guest_training'); // bring in training progress from this person's guest account
+    const { data: s, error } = await supabase.rpc('final_status');
+    if (error) { app.innerHTML = `<div class="notice notice-bad">${esc(error.message)}</div>`; return; }
+
+    // Already submitted
+    if (s.attempt?.submitted_at) {
+      let html = `<h1>${esc(s.title)}</h1><div class="notice notice-good">You submitted your test on ${fmt(s.attempt.submitted_at)}. Thank you.</div>`;
+      if (s.results_released) {
+        const { data: r } = await supabase.rpc('my_final_result');
+        if (r) {
+          const secs = Object.entries(r.sections ?? {}).map(([k, v]: any) =>
+            `<tr><td>${esc(SECTION_TITLES[k] ?? k)}</td><td class="num">${+v.score} / ${+v.max}</td></tr>`).join('');
+          html += `<div class="card"><h2 style="margin-top:0">Your result</h2>
+            <p style="font-size:1.4rem;font-weight:700">${+r.total} / ${+r.max}</p>
+            <div class="table-wrap"><table><tbody>${secs}</tbody></table></div>
+            ${r.feedback?.length ? `<h3>Feedback from markers</h3>` + r.feedback.map((f: any) =>
+              `<div class="explain"><strong>${esc(f.prompt.slice(0, 120))}${f.prompt.length > 120 ? '…' : ''}</strong>${esc(f.comment)}</div>`).join('') : ''}
+          </div>`;
+        }
+      } else {
+        html += `<p class="muted">Results will appear here once the CA team releases them.</p>`;
+      }
+      app.innerHTML = html;
+      return;
+    }
+
+    // In progress → resume
+    if (s.attempt && !s.attempt.submitted_at && new Date(s.attempt.deadline) > new Date(s.now)) return start();
+
+    // Not started (or ran out of time without submitting)
+    const timedOut = s.attempt && !s.attempt.submitted_at;
+    if (timedOut) {
+      // Time ran out without pressing Submit (e.g. the page was closed): submit what was saved.
+      const { error: subErr } = await supabase.rpc('submit_final');
+      if (!subErr) return load();
+    }
+    let status = '';
+    if (timedOut) status = `<div class="notice notice-warn">Your time has run out. Your saved answers will be submitted automatically.</div>`;
+    else if (!s.eligible) status = `<div class="notice notice-warn">Your email isn't on the list for the final test. If you're a registered judge, contact the CA team and make sure you signed in with the email you registered.</div>`;
+    else if (!s.opens_at || new Date(s.now) < new Date(s.opens_at)) status = `<div class="notice">The test isn't open yet.${s.opens_at ? ` It opens on <strong>${fmt(s.opens_at)}</strong>.` : ''}</div>`;
+    else if (!s.is_open) status = `<div class="notice notice-warn">The test has closed.</div>`;
+    else {
+      const { data: me } = await supabase.from('profiles').select('full_name').eq('id', user.id).maybeSingle();
+      if (!me?.full_name) status = `<div class="notice">Before you start, please <a href="${path('account/')}">add your name and nation</a>.</div>`;
+    }
+
+    app.innerHTML = `
+      <h1>${esc(s.title)}</h1>
+      ${s.instructions ? `<div class="card prompt">${esc(s.instructions)}</div>` : ''}
+      <div class="card">
+        <ul style="margin:0">
+          <li>Time limit: <strong>${s.time_limit_minutes} minutes</strong>, starting when you press Start. The timer keeps running if you close the page.</li>
+          <li>Window: ${fmt(s.opens_at)} to ${fmt(s.closes_at)}</li>
+          <li>One attempt only. Answers save automatically as you go.</li>
+          <li>Three sections: multiple choice, judging a recorded debate, and written answers marked by the CA team.</li>
+          <li>Have headphones ready for the debate video.</li>
+        </ul>
+      </div>
+      ${status}
+      ${!status ? `<button class="btn" id="start">Start the test</button>` : ''}`;
+    document.getElementById('start')?.addEventListener('click', () => {
+      if (confirm(`Start now? You'll have ${s.time_limit_minutes} minutes and only one attempt.`)) start();
+    });
+  }
+
+  // Judges sign in for the test with an emailed link, which proves the email is theirs.
+  function emailForm() {
+    app.innerHTML = `
+      <h1>Final test</h1>
+      <p>The final test is for judges registered for the tournament. Enter the email address you registered with, and we'll email you a link that opens the test. Your training progress stays with you.</p>
+      <form class="card" id="tf" style="max-width:480px">
+        <div class="field"><label for="tf-email">Registered email</label><input id="tf-email" type="email" required autocomplete="email"></div>
+        <button class="btn" type="submit">Email me my test link</button>
+        <div class="notice" id="tf-msg" hidden></div>
+      </form>`;
+    (document.getElementById('tf') as HTMLFormElement).onsubmit = async (e) => {
+      e.preventDefault();
+      const email = (document.getElementById('tf-email') as HTMLInputElement).value.trim().toLowerCase();
+      const msg = document.getElementById('tf-msg')!;
+      const { error } = await supabase!.auth.signInWithOtp({ email, options: { emailRedirectTo: location.origin + path('final/') } });
+      msg.hidden = false;
+      msg.className = 'notice ' + (error ? 'notice-bad' : 'notice-good');
+      msg.textContent = error ? error.message : `Check ${email} for your link (it may take a minute or land in spam). Open it on the device you'll take the test on.`;
+    };
+  }
+
+  // ---------------- Test runner ----------------
+  let deadline = 0, skew = 0, timerId: any, submitting = false;
+  const pending = new Map<string, any>();
+
+  async function start() {
+    app.innerHTML = '<p class="muted">Loading your test…</p>';
+    const { data, error } = await supabase!.rpc('start_final');
+    if (error) { app.innerHTML = `<div class="notice notice-bad">${esc(error.message)}</div>`; return; }
+    skew = new Date(data.now).getTime() - Date.now();
+    deadline = new Date(data.deadline).getTime();
+    render(data.questions, data.answers ?? {});
+    tick(); timerId = setInterval(tick, 1000);
+    window.addEventListener('beforeunload', (e) => { if (pending.size && !submitting) { e.preventDefault(); } });
+  }
+
+  function render(questions: any[], answers: Record<string, any>) {
+    let html = `<div class="timer" id="timer"><span>Time left: <span class="clock" id="clock">--:--</span></span>
+      <span class="save-state" id="save-state">All answers saved</span>
+      <button class="btn btn-small" id="submit-top">Submit test</button></div>`;
+    let section = '', n = 0;
+    for (const q of questions) {
+      if (q.section !== section) {
+        if (section) html += '</section>';
+        section = q.section;
+        html += `<section><h2>${esc(SECTION_TITLES[section] ?? section)}</h2>`;
+      }
+      n++;
+      const a = answers[q.id] ?? null;
+      html += `<div class="card quiz-q" data-qid="${q.id}" data-kind="${q.kind}">
+        <div class="row" style="justify-content:space-between"><span class="muted small">Question ${n}</span><span class="badge">${+q.points} ${+q.points === 1 ? 'mark' : 'marks'}</span></div>
+        <h3 class="prompt">${esc(q.prompt)}</h3>${media(q.media_url)}${field(q, a)}</div>`;
+    }
+    html += `</section><div class="card row" style="justify-content:space-between"><span>Check your answers, then submit. You can't change them afterwards.</span><button class="btn" id="submit-bottom">Submit test</button></div>`;
+    app.innerHTML = html;
+
+    app.querySelectorAll<HTMLElement>('.quiz-q').forEach((el) => {
+      const qid = el.dataset.qid!, kind = el.dataset.kind!;
+      const onChange = (debounce: number) => () => queueSave(qid, readAnswer(el, kind), debounce);
+      el.querySelectorAll('input[type=radio]').forEach((i) => i.addEventListener('change', onChange(0)));
+      el.querySelectorAll('input[type=number]').forEach((i) => i.addEventListener('input', () => { updateTotals(el); onChange(1200)(); }));
+      el.querySelectorAll('textarea').forEach((t) => t.addEventListener('input', () => { wordCount(el); onChange(1500)(); }));
+      if (kind === 'scores') updateTotals(el);
+      if (kind === 'written') wordCount(el);
+    });
+    document.getElementById('submit-top')!.onclick = () => submit(false);
+    document.getElementById('submit-bottom')!.onclick = () => submit(false);
+  }
+
+  function media(url: string | null) {
+    if (!url) return '';
+    const e = youtubeEmbed(url);
+    return e ? `<div class="video"><iframe src="${e}" title="Debate recording" allow="encrypted-media; fullscreen" allowfullscreen></iframe></div>`
+             : `<p><a href="${esc(url)}" target="_blank" rel="noopener">Open the material for this question ↗</a></p>`;
+  }
+
+  function field(q: any, a: any) {
+    const name = 'q' + q.id;
+    if (q.kind === 'mcq' || q.kind === 'call') {
+      const opts: string[] = q.options ?? [];
+      return opts.map((o, i) => {
+        const val = q.kind === 'mcq' ? String(i) : o;
+        const checked = a && String(a.choice) === val ? 'checked' : '';
+        return `<label class="opt"><input type="radio" name="${name}" value="${esc(val)}" ${checked}> <span>${esc(o)}</span></label>`;
+      }).join('');
+    }
+    if (q.kind === 'scores') {
+      const rows = (q.options ?? []).map((s: any, i: number) => {
+        const v = a?.scores?.[i] ?? '';
+        return `<label for="${name}_${i}" style="font-weight:500">${esc(s.label)} <span class="hint">(${s.min}–${s.max})</span></label>
+          <input id="${name}_${i}" type="number" inputmode="decimal" step="0.5" min="${s.min}" max="${s.max}" value="${v}" data-side="${esc(s.side ?? '')}">`;
+      }).join('');
+      return `<div class="scores-grid">${rows}</div><div class="side-totals" data-totals></div><div class="hint" data-warn></div>`;
+    }
+    return `<textarea name="${name}" rows="10" placeholder="Type your answer here">${esc(a?.text ?? '')}</textarea><div class="hint" data-wc></div>`;
+  }
+
+  function readAnswer(el: HTMLElement, kind: string) {
+    if (kind === 'mcq') { const c = el.querySelector<HTMLInputElement>('input:checked'); return c ? { choice: Number(c.value) } : null; }
+    if (kind === 'call') { const c = el.querySelector<HTMLInputElement>('input:checked'); return c ? { choice: c.value } : null; }
+    if (kind === 'scores') return { scores: [...el.querySelectorAll<HTMLInputElement>('input[type=number]')].map((i) => i.value === '' ? null : Number(i.value)) };
+    return { text: el.querySelector('textarea')!.value };
+  }
+
+  function updateTotals(el: HTMLElement) {
+    const inputs = [...el.querySelectorAll<HTMLInputElement>('input[type=number]')];
+    const sums: Record<string, number> = {};
+    let bad = 0;
+    for (const i of inputs) {
+      if (i.value === '') continue;
+      const v = Number(i.value);
+      const ok = v >= Number(i.min) && v <= Number(i.max) && Math.round(v * 2) === v * 2;
+      i.style.borderColor = ok ? '' : 'var(--bad)';
+      if (!ok) bad++;
+      if (i.dataset.side) sums[i.dataset.side] = (sums[i.dataset.side] ?? 0) + v;
+    }
+    const sides = Object.keys(sums);
+    let txt = sides.map((s) => `${esc(s)}: ${sums[s]}`).join(' · ');
+    if (sides.length === 2) txt += ` · Margin: ${Math.abs(sums[sides[0]] - sums[sides[1]])}`;
+    el.querySelector('[data-totals]')!.innerHTML = txt;
+    el.querySelector('[data-warn]')!.textContent = bad ? `${bad} score(s) outside the allowed range or not in 0.5 steps.` : '';
+  }
+
+  function wordCount(el: HTMLElement) {
+    const t = el.querySelector('textarea')!.value.trim();
+    el.querySelector('[data-wc]')!.textContent = `${t ? t.split(/\s+/).length : 0} words`;
+  }
+
+  // ---- saving ----
+  const timers = new Map<string, any>();
+  function setSaveState(text: string, cls = '') { const s = document.getElementById('save-state'); if (s) { s.textContent = text; s.className = 'save-state ' + cls; } }
+  function queueSave(qid: string, answer: any, delay: number) {
+    pending.set(qid, answer);
+    setSaveState('Saving…');
+    clearTimeout(timers.get(qid));
+    timers.set(qid, setTimeout(() => flush(qid), delay));
+  }
+  async function flush(qid: string) {
+    if (!pending.has(qid)) return true;
+    const answer = pending.get(qid);
+    const { error } = await supabase!.rpc('save_final_answer', { p_question_id: Number(qid), p_answer: answer });
+    if (error) { setSaveState('Not saved: ' + error.message, 'error'); return false; }
+    if (pending.get(qid) === answer) pending.delete(qid);
+    if (!pending.size) setSaveState('All answers saved', 'saved');
+    return true;
+  }
+  async function flushAll() {
+    timers.forEach((t) => clearTimeout(t));
+    const results = await Promise.all([...pending.keys()].map(flush));
+    return results.every(Boolean);
+  }
+
+  function tick() {
+    const left = Math.max(0, deadline - (Date.now() + skew));
+    const m = Math.floor(left / 60000), s = Math.floor((left % 60000) / 1000);
+    const clock = document.getElementById('clock');
+    if (clock) clock.textContent = `${m}:${String(s).padStart(2, '0')}`;
+    document.getElementById('timer')?.classList.toggle('low', left < 5 * 60000);
+    if (left <= 0 && !submitting) submit(true);
+  }
+
+  async function submit(auto: boolean) {
+    if (submitting) return;
+    if (!auto) {
+      const badScores = app.querySelectorAll('[data-warn]:not(:empty)').length;
+      const msg = (badScores ? 'Some speaker scores are outside the allowed range or not in 0.5 steps. ' : '') +
+        'Submit your test now? You will not be able to change your answers.';
+      if (!confirm(msg)) return;
+    }
+    submitting = true;
+    clearInterval(timerId);
+    setSaveState('Submitting…');
+    await flushAll();
+    const { error } = await supabase!.rpc('submit_final');
+    if (error) { submitting = false; toast('Could not submit: ' + error.message, 'error'); setSaveState('Submit failed. Try again.', 'error'); return; }
+    window.scrollTo(0, 0);
+    load();
+  }
+
+  load();
+</script>

@@ -3,7 +3,7 @@
 A free training site for WSDC judges:
 
 - **Open training, no email link needed**: share the site link and judges start straight away. The first time, they enter their name, email and nation, and get a guest account in the background. Their progress is saved, they can pick up where they left off, and the CA team can see who has completed what.
-- **Training modules**: written lessons with optional embedded videos, each ending in a practice quiz that shows the expected answer and the reasoning.
+- **Training modules, edited on the site**: CAs create and edit lessons, videos, images and practice quizzes from the dashboard, with formatting buttons and a live preview. No GitHub or code needed. Each module ends with a practice quiz that shows the expected answer and the reasoning.
 - **Final placement test**: judges request a sign-in link on the Final test page with their registered email. The test has multiple choice, judging a recorded debate (call + speaker scores), and written answers. One attempt each, timed, autosaved, and only open to approved emails. Their training record is merged into the same account automatically.
 - **CA dashboard**: results table with CSV export, anonymous marking of written answers against a rubric, training progress, a question editor, the approved-judge list and test settings (open/close times, time limit, releasing results).
 
@@ -28,7 +28,7 @@ The site's code is public on GitHub, so **no questions, answer keys or rubrics l
 
 ### 1. Supabase
 1. Create a free project at [supabase.com](https://supabase.com).
-2. Go to **SQL Editor → New query**, paste the contents of `supabase/schema.sql`, and click **Run**.
+2. Go to **SQL Editor → New query**, paste the contents of `supabase/schema.sql`, and click **Run**. Then open another new query, paste `supabase/modules.sql` (modules, image storage and the two starter modules), and click **Run**.
 3. Go to **Authentication → Sign In / Providers** and turn on **Allow anonymous sign-ins** (this powers the no-email guest training accounts). Leave **Email** enabled for the final test.
    - Supabase limits how many guest accounts can be created per hour from one internet connection. If you run a live training session where many judges share one Wi-Fi network, raise the limit under **Authentication → Rate Limits** beforehand.
    - Optional: switch on CAPTCHA protection (Authentication → Attack Protection) to stop bots creating guest accounts.
@@ -47,9 +47,9 @@ The site's code is public on GitHub, so **no questions, answer keys or rubrics l
 4. Push to `main` (or run the workflow manually). The site appears at `https://YOUR-GITHUB-USERNAME.github.io/REPO-NAME/`.
 
 ### 3. Make yourself an admin
-Sign in on the site once, then in Supabase **SQL Editor** run:
+Sign in on the site once with **Sign in with email** (footer) and click the emailed link, then in Supabase **SQL Editor** run:
 ```sql
-update public.profiles set role = 'admin' where email = 'you@example.com';
+update public.profiles set role = 'admin' where verified_email = 'you@example.com' returning id, verified_email, role;
 ```
 Reload the site and an **Admin** link appears. Repeat for each CA.
 
@@ -58,32 +58,16 @@ Reload the site and an **Admin** link appears. Repeat for each CA.
 ## Day-to-day use
 
 ### Adding or editing a module
-Modules are Markdown files in `src/content/modules/`. Copy an existing one and change the top section:
+Everything happens on the site under **Admin → Modules**:
+- **+ New module**: give it a title (the web address fills itself in), a one-line summary, an estimated time and, optionally, a main YouTube video.
+- **Lesson content**: write in the editor. Use the toolbar for headings, **bold**, lists, quotes, tables, links and images (images upload straight from your computer, up to 5 MB). Click the 👁 eye to preview. To add extra videos anywhere, paste a YouTube link on its own line.
+- **Practice quiz**: add multiple-choice questions (tick the correct option and write an explanation) or written questions with a model answer. Use ↑ ↓ to reorder.
+- Tick **Published** when it's ready. Drafts are only visible to the CA team, and you can open a draft with **View** to check it.
+- Use the ↑ ↓ buttons in the module list to change the order judges see.
 
-```yaml
----
-title: Scoring and margins
-order: 3                      # position in the list
-minutes: 20                   # optional
-summary: One line shown in the module list.
-video: https://youtu.be/...   # optional, unlisted YouTube links work
-draft: true                   # hides it until you're ready
-quiz:
-  - type: mcq
-    question: ...
-    options: [ "...", "...", "..." ]
-    answer: 1                 # 0 = first option
-    explanation: Shown after answering. Explain why, and cite the Manual/Rules.
-  - type: open
-    question: A practice written question
-    model_answer: Shown when the judge clicks "Show model answer".
----
-Lesson text in Markdown...
-```
+Changes go live as soon as you click **Save**.
 
-You can edit files directly on github.com. The site rebuilds automatically in about a minute.
-
-> Practice quizzes are in the public code, so judges can see those answers. That's fine for practice. Put anything used for placement in the final test instead.
+> Practice-quiz answers aren't secret (judges need to see them). Put anything used for placement in **Final test questions** instead.
 
 ### How judges move between devices
 Training progress is tied to the browser they started on. To continue elsewhere, judges either:
@@ -120,10 +104,11 @@ npm run dev            # http://localhost:4321
 
 ## Structure
 ```
-src/content/modules/   lessons + practice quizzes (Markdown)
-src/pages/             home, modules, login, account, final test, admin
+src/pages/             home, module list, module page, login, account, final test, admin
+src/lib/module-editor.js  the Admin → Modules editor
 src/lib/supabase.js    Supabase client + helpers
 supabase/schema.sql    database tables, security rules and marking functions
+supabase/modules.sql   training modules table, image storage, starter modules
 supabase/final_questions.example.sql   sample test questions for trying it out
 .github/workflows/     automatic deploy to GitHub Pages
 ```
