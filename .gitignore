@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.astro/
+.env
+.env.*
+!.env.example
+# Never commit real final-quiz questions or answer keys
+supabase/final_questions*.sql
+!supabase/final_questions.example.sql
