@@ -1,0 +1,429 @@
+---
+import Base from '../layouts/Base.astro';
+---
+<Base title="Admin" wide>
+  <h1>CA dashboard</h1>
+  <div id="gate"><p class="muted">Checking access…</p></div>
+  <div id="admin" hidden>
+    <div class="tabs" role="tablist">
+      <button role="tab" data-tab="results" aria-selected="true">Results</button>
+      <button role="tab" data-tab="modules">Modules</button>
+      <button role="tab" data-tab="marking">Marking</button>
+      <button role="tab" data-tab="progress">Training progress</button>
+      <button role="tab" data-tab="questions">Final test questions</button>
+      <button role="tab" data-tab="judges">Approved judges</button>
+      <button role="tab" data-tab="settings">Test settings</button>
+    </div>
+    <section data-panel="results"></section>
+    <section data-panel="modules" hidden></section>
+    <section data-panel="marking" hidden></section>
+    <section data-panel="progress" hidden></section>
+    <section data-panel="questions" hidden></section>
+    <section data-panel="judges" hidden></section>
+    <section data-panel="settings" hidden></section>
+  </div>
+</Base>
+
+<script>
+  import { supabase, esc, toast, downloadCsv } from '../lib/supabase.js';
+  import { fetchModules } from '../lib/modules.js';
+  import { loadModulesPanel } from '../lib/module-editor.js';
+  let MODULES: { slug: string; title: string; order: number }[] = [];
+  const $ = (sel: string, root: ParentNode = document) => root.querySelector(sel) as HTMLElement;
+  const panel = (name: string) => $(`[data-panel="${name}"]`);
+  const n = (v: any) => (v === null || v === undefined ? '' : +Number(v).toFixed(2));
+  const fmt = (d: string | null) => (d ? new Date(d).toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'short' }) : '');
+  const loaders: Record<string, () => Promise<void>> = {};
+
+  // ---------- Access + tabs ----------
+  (async () => {
+    const gate = $('#gate');
+    if (!supabase) { gate.innerHTML = '<div class="notice notice-warn">Connect Supabase to use the dashboard.</div>'; return; }
+    const { data } = await supabase.auth.getSession();
+    if (!data.session) { gate.innerHTML = '<div class="notice">Sign in with an admin account.</div>'; return; }
+    const { data: isAdmin } = await supabase.rpc('is_admin');
+    if (!isAdmin) { gate.innerHTML = '<div class="notice notice-bad">This page is for the CA team only.</div>'; return; }
+    gate.remove();
+    $('#admin').hidden = false;
+    document.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((b) => b.addEventListener('click', () => showTab(b.dataset.tab!)));
+    showTab('results');
+  })();
+
+  function showTab(name: string) {
+    document.querySelectorAll<HTMLButtonElement>('[data-tab]').forEach((b) => b.setAttribute('aria-selected', String(b.dataset.tab === name)));
+    document.querySelectorAll<HTMLElement>('[data-panel]').forEach((p) => (p.hidden = p.dataset.panel !== name));
+    loaders[name]?.();
+  }
+
+  // ---------- Results ----------
+  loaders.results = async () => {
+    const el = panel('results');
+    el.innerHTML = '<p class="muted">Loading…</p>';
+    const { data, error } = await supabase!.rpc('admin_results');
+    if (error) { el.innerHTML = `<div class="notice notice-bad">${esc(error.message)}</div>`; return; }
+    const rows = data ?? [];
+    const unmarked = rows.reduce((s: number, r: any) => s + (r.submitted_at ? r.to_mark : 0), 0);
+    const inProgress = rows.filter((r: any) => !r.submitted_at).length;
+    el.innerHTML = `
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <div class="row">
+          <span class="badge">${rows.length} started</span>
+          <span class="badge ${inProgress ? 'badge-warn' : ''}">${inProgress} not submitted</span>
+          <span class="badge ${unmarked ? 'badge-warn' : 'badge-good'}">${unmarked} written answers to mark</span>
+        </div>
+        <div class="row">
+          <button class="btn btn-ghost btn-small" id="close-expired" title="Submit attempts whose time ran out">Close timed-out attempts</button>
+          <button class="btn btn-ghost btn-small" id="regrade" title="Re-run automatic marking, e.g. after fixing an answer key">Re-mark automatic questions</button>
+          <button class="btn btn-small" id="export-results">Export CSV</button>
+        </div>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>#</th><th>Name</th><th>Nation</th><th>Email</th><th>Submitted</th>
+          <th class="num">MCQ</th><th class="num">Debate</th><th class="num">Written</th><th class="num">To mark</th><th class="num">Total</th><th class="num">%</th></tr></thead>
+        <tbody>${rows.map((r: any, i: number) => `<tr>
+          <td>${i + 1}</td><td>${esc(r.full_name ?? '—')}</td><td>${esc(r.nation ?? '')}</td><td>${esc(r.email)}</td>
+          <td>${r.submitted_at ? fmt(r.submitted_at) : '<span class="badge badge-warn">in progress</span>'}</td>
+          <td class="num">${n(r.mcq)} / ${n(r.mcq_max)}</td><td class="num">${n(r.debate)} / ${n(r.debate_max)}</td>
+          <td class="num">${n(r.written)} / ${n(r.written_max)}</td>
+          <td class="num">${r.to_mark ? `<span class="badge badge-warn">${r.to_mark}</span>` : '✓'}</td>
+          <td class="num"><strong>${n(r.total)}</strong> / ${n(r.total_max)}</td>
+          <td class="num">${r.total_max ? Math.round((r.total / r.total_max) * 100) : 0}%</td></tr>`).join('') || '<tr><td colspan="11" class="muted">No attempts yet.</td></tr>'}
+        </tbody></table></div>
+      <p class="hint" style="margin-top:8px">Written answers count as 0 until they're marked. Release results under Test settings once marking is finished.</p>`;
+    $('#export-results').onclick = () => downloadCsv('final-test-results.csv', [
+      ['Rank', 'Name', 'Nation', 'Email', 'Submitted', 'MCQ', 'MCQ max', 'Debate', 'Debate max', 'Written', 'Written max', 'Unmarked', 'Total', 'Total max', 'Percent'],
+      ...rows.map((r: any, i: number) => [i + 1, r.full_name, r.nation, r.email, r.submitted_at, n(r.mcq), n(r.mcq_max), n(r.debate), n(r.debate_max),
+        n(r.written), n(r.written_max), r.to_mark, n(r.total), n(r.total_max), r.total_max ? Math.round((r.total / r.total_max) * 100) : 0]),
+    ]);
+    $('#close-expired').onclick = async () => {
+      const { data: c, error: e } = await supabase!.rpc('admin_close_expired');
+      if (e) return toast(e.message, 'error');
+      toast(`${c} timed-out attempt(s) submitted`); loaders.results();
+    };
+    $('#regrade').onclick = async () => {
+      const { data: c, error: e } = await supabase!.rpc('admin_regrade_all');
+      if (e) return toast(e.message, 'error');
+      toast(`Re-marked ${c} attempt(s)`); loaders.results();
+    };
+  };
+
+  // ---------- Marking ----------
+  let showNames = false;
+  loaders.marking = async () => {
+    const el = panel('marking');
+    el.innerHTML = '<p class="muted">Loading…</p>';
+    const [{ data: qs }, { data: ans, error }] = await Promise.all([
+      supabase!.from('final_questions').select('id, prompt, points, rubric, section, position').eq('kind', 'written').order('section').order('position'),
+      supabase!.from('final_answers')
+        .select('attempt_id, question_id, answer, manual_points, marker_comment, marked_at, final_questions!inner(kind), final_attempts!inner(submitted_at, profiles(full_name, email))')
+        .eq('final_questions.kind', 'written').not('final_attempts.submitted_at', 'is', null)
+        .order('attempt_id'),
+    ]);
+    if (error) { el.innerHTML = `<div class="notice notice-bad">${esc(error.message)}</div>`; return; }
+    const questions = qs ?? [];
+    const answers = ans ?? [];
+    const state = { q: String(questions[0]?.id ?? ''), unmarkedOnly: true };
+
+    const draw = () => {
+      const q = questions.find((x: any) => String(x.id) === state.q);
+      const list = answers.filter((a: any) => String(a.question_id) === state.q && (!state.unmarkedOnly || a.manual_points === null));
+      const done = answers.filter((a: any) => String(a.question_id) === state.q && a.manual_points !== null).length;
+      const all = answers.filter((a: any) => String(a.question_id) === state.q).length;
+      el.innerHTML = `
+        <div class="row" style="margin-bottom:12px">
+          <div style="flex:1;min-width:240px"><label for="mq">Question</label><select id="mq">${questions.map((x: any) =>
+            `<option value="${x.id}" ${String(x.id) === state.q ? 'selected' : ''}>[${x.section}] ${esc(x.prompt.slice(0, 90))}</option>`).join('')}</select></div>
+          <label class="row" style="font-weight:500"><input type="checkbox" id="mu" ${state.unmarkedOnly ? 'checked' : ''}> Unmarked only</label>
+          <label class="row" style="font-weight:500"><input type="checkbox" id="mn" ${showNames ? 'checked' : ''}> Show names</label>
+        </div>
+        ${q ? `<div class="card"><p class="prompt" style="margin-top:0"><strong>${esc(q.prompt)}</strong></p>
+          <p class="small muted">Out of ${+q.points} · ${done} of ${all} marked</p>
+          ${q.rubric ? `<details open><summary><strong>Marking rubric</strong></summary><div class="answer-box">${esc(q.rubric)}</div></details>` : ''}</div>` : '<p class="muted">No written questions yet.</p>'}
+        <div id="mlist">${list.map((a: any) => {
+          const who = showNames ? esc(a.final_attempts.profiles?.full_name || a.final_attempts.profiles?.email) : `Candidate ${a.attempt_id}`;
+          return `<div class="card" data-a="${a.attempt_id}">
+            <div class="row" style="justify-content:space-between"><strong>${who}</strong>${a.manual_points !== null ? `<span class="badge badge-good">Marked ${+a.manual_points}</span>` : ''}</div>
+            <div class="answer-box">${esc(a.answer?.text || '(no answer)')}</div>
+            <div class="row" style="align-items:flex-end">
+              <div style="width:120px"><label>Mark (0–${+q.points})</label><input type="number" step="0.5" min="0" max="${+q.points}" value="${a.manual_points ?? ''}" data-pts></div>
+              <div style="flex:1;min-width:200px"><label>Comment for the judge <span class="hint">(optional, shown with results)</span></label><input type="text" value="${esc(a.marker_comment ?? '')}" data-cmt></div>
+              <button class="btn btn-small" data-save>Save mark</button>
+            </div></div>`;
+        }).join('') || `<p class="muted">${state.unmarkedOnly ? 'Everything here is marked.' : 'No submitted answers yet.'}</p>`}</div>`;
+      $('#mq', el).onchange = (e) => { state.q = (e.target as HTMLSelectElement).value; draw(); };
+      $('#mu', el).onchange = (e) => { state.unmarkedOnly = (e.target as HTMLInputElement).checked; draw(); };
+      $('#mn', el).onchange = (e) => { showNames = (e.target as HTMLInputElement).checked; draw(); };
+      el.querySelectorAll<HTMLElement>('[data-a]').forEach((card) => {
+        $('[data-save]', card).onclick = async () => {
+          const raw = ($('[data-pts]', card) as HTMLInputElement).value;
+          const pts = raw === '' ? null : Number(raw);
+          const cmt = ($('[data-cmt]', card) as HTMLInputElement).value.trim() || null;
+          const { error: e } = await supabase!.rpc('admin_mark_answer', { p_attempt: Number(card.dataset.a), p_question: Number(state.q), p_points: pts, p_comment: cmt });
+          if (e) return toast(e.message, 'error');
+          const rec = answers.find((x: any) => String(x.attempt_id) === card.dataset.a && String(x.question_id) === state.q);
+          if (rec) { rec.manual_points = pts; rec.marker_comment = cmt; }
+          toast('Mark saved');
+          draw();
+        };
+      });
+    };
+    draw();
+  };
+
+  // ---------- Modules (editor) ----------
+  loaders.modules = () => loadModulesPanel(panel('modules'));
+
+  // ---------- Training progress ----------
+  loaders.progress = async () => {
+    const el = panel('progress');
+    el.innerHTML = '<p class="muted">Loading…</p>';
+    MODULES = (await fetchModules().catch(() => [])).map((m: any, i: number) => ({ slug: m.slug, title: m.title, order: i + 1 }));
+    const { data, error } = await supabase!.from('profiles')
+      .select('id, full_name, email, verified_email, is_guest, merged_into, nation, role, created_at, module_progress(module_slug, completed_at, practice_score, practice_total)').order('full_name');
+    if (error) { el.innerHTML = `<div class="notice notice-bad">${esc(error.message)}</div>`; return; }
+    // Hide CAs, guest accounts merged into a verified account, and visitors who never entered details.
+    const people = (data ?? []).filter((p: any) => p.role !== 'admin' && !p.merged_into && p.full_name);
+    const cell = (p: any, m: any) => {
+      const r = p.module_progress.find((x: any) => x.module_slug === m.slug);
+      if (!r) return '<td class="muted">—</td>';
+      const quiz = r.practice_total ? `${r.practice_score}/${r.practice_total}` : '';
+      return `<td>${r.completed_at ? '✓' : '…'} ${quiz}</td>`;
+    };
+    const perModule = MODULES.map((m) => people.filter((p: any) => p.module_progress.some((x: any) => x.module_slug === m.slug && x.completed_at)).length);
+    el.innerHTML = `
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <span class="badge">${people.length} judges in training</span>
+        <button class="btn btn-small" id="export-progress">Export CSV</button>
+      </div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Name</th><th>Nation</th><th>Email</th><th>Account</th>${MODULES.map((m) => `<th title="${esc(m.title)}">M${m.order}</th>`).join('')}<th class="num">Done</th></tr></thead>
+        <tbody>${people.map((p: any) => `<tr><td>${esc(p.full_name ?? '—')}</td><td>${esc(p.nation ?? '')}</td><td>${esc(p.verified_email || p.email || '')}</td>
+          <td>${p.verified_email ? '<span class="badge badge-good" title="Signed in with an emailed link">Verified</span>' : '<span class="badge" title="Email typed in, not confirmed">Guest</span>'}</td>
+          ${MODULES.map((m) => cell(p, m)).join('')}
+          <td class="num">${p.module_progress.filter((x: any) => x.completed_at).length}/${MODULES.length}</td></tr>`).join('') || '<tr><td colspan="9" class="muted">No judges yet.</td></tr>'}
+        <tr><td colspan="4"><strong>Completed by</strong></td>${perModule.map((c) => `<td><strong>${c}</strong></td>`).join('')}<td></td></tr>
+        </tbody></table></div>
+      <p class="hint" style="margin-top:8px">Guest = email typed in by the judge, not confirmed. Verified = signed in with an emailed link. ✓ = marked complete · … = started · numbers = best practice-quiz score. ${MODULES.map((m) => `M${m.order}: ${esc(m.title)}`).join(' · ')}</p>`;
+    $('#export-progress').onclick = () => downloadCsv('training-progress.csv', [
+      ['Name', 'Nation', 'Email', 'Account', 'Started', ...MODULES.flatMap((m) => [`M${m.order} completed`, `M${m.order} quiz`])],
+      ...people.map((p: any) => [p.full_name, p.nation, p.verified_email || p.email, p.verified_email ? 'verified' : 'guest', p.created_at?.slice(0, 10), ...MODULES.flatMap((m) => {
+        const r = p.module_progress.find((x: any) => x.module_slug === m.slug);
+        return [r?.completed_at ? 'yes' : 'no', r?.practice_total ? `${r.practice_score}/${r.practice_total}` : ''];
+      })]),
+    ]);
+  };
+
+  // ---------- Questions editor ----------
+  loaders.questions = async () => {
+    const el = panel('questions');
+    el.innerHTML = '<p class="muted">Loading…</p>';
+    const { data, error } = await supabase!.from('final_questions').select('*').order('section').order('position').order('id');
+    if (error) { el.innerHTML = `<div class="notice notice-bad">${esc(error.message)}</div>`; return; }
+    const qs = data ?? [];
+    const order = { mcq: 1, debate: 2, written: 3 } as Record<string, number>;
+    qs.sort((a: any, b: any) => order[a.section] - order[b.section] || a.position - b.position);
+    const total = qs.filter((q: any) => q.active).reduce((s: number, q: any) => s + Number(q.points), 0);
+    const summary = (q: any) => {
+      if (q.kind === 'mcq') return `Answer: ${esc(q.options?.[q.answer_key?.correct] ?? '?')}`;
+      if (q.kind === 'call') return `Answer: ${esc(q.answer_key?.correct ?? '?')}`;
+      if (q.kind === 'scores') return `Reference: ${(q.answer_key?.reference ?? []).join(', ')} (±${q.answer_key?.tolerance ?? 1})`;
+      return q.rubric ? 'Has rubric' : '<span class="badge badge-warn">No rubric</span>';
+    };
+    el.innerHTML = `
+      <div class="notice">These questions and answer keys are stored only in the database. Judges never receive the answers. Avoid editing questions once judges have started the test.</div>
+      <div class="row" style="justify-content:space-between;margin-bottom:12px">
+        <span class="badge">${qs.filter((q: any) => q.active).length} active questions · ${n(total)} marks</span>
+        <button class="btn btn-small" id="q-new">Add question</button>
+      </div>
+      <div id="q-form"></div>
+      <div class="table-wrap"><table>
+        <thead><tr><th>Section</th><th>Type</th><th>#</th><th>Question</th><th>Key</th><th class="num">Marks</th><th></th></tr></thead>
+        <tbody>${qs.map((q: any) => `<tr style="${q.active ? '' : 'opacity:.5'}"><td>${q.section}</td><td>${q.kind}</td><td>${q.position}</td>
+          <td style="white-space:normal;min-width:260px">${esc(q.prompt.slice(0, 140))}${q.prompt.length > 140 ? '…' : ''}${q.active ? '' : ' <span class="badge">inactive</span>'}</td>
+          <td style="white-space:normal">${summary(q)}</td><td class="num">${+q.points}</td>
+          <td><button class="btn btn-ghost btn-small" data-edit="${q.id}">Edit</button></td></tr>`).join('') || '<tr><td colspan="7" class="muted">No questions yet.</td></tr>'}
+        </tbody></table></div>`;
+    $('#q-new').onclick = () => questionForm(null);
+    el.querySelectorAll<HTMLElement>('[data-edit]').forEach((b) => (b.onclick = () => questionForm(qs.find((q: any) => String(q.id) === b.dataset.edit))));
+  };
+
+  function questionForm(q: any) {
+    const box = $('#q-form');
+    const kind = q?.kind ?? 'mcq';
+    box.innerHTML = `<form class="card" id="qf" style="margin-bottom:16px">
+      <h3 style="margin-top:0">${q ? 'Edit question' : 'New question'}</h3>
+      <div class="row">
+        <div class="field" style="flex:1;min-width:160px"><label>Type</label><select id="f-kind">
+          <option value="mcq">Multiple choice</option><option value="call">Debate call (who won)</option>
+          <option value="scores">Speaker scores</option><option value="written">Written answer (CA-marked)</option></select></div>
+        <div class="field" style="flex:1;min-width:160px"><label>Section</label><select id="f-section">
+          <option value="mcq">A: Multiple choice</option><option value="debate">B: Judge the debate</option><option value="written">C: Written</option></select></div>
+        <div class="field" style="width:110px"><label>Order</label><input id="f-pos" type="number" value="${q?.position ?? 0}"></div>
+        <div class="field" style="width:110px"><label>Marks</label><input id="f-pts" type="number" step="0.5" min="0" value="${q?.points ?? 1}"></div>
+      </div>
+      <div class="field"><label>Question / instructions</label><textarea id="f-prompt" rows="4" required>${esc(q?.prompt ?? '')}</textarea></div>
+      <div class="field"><label>Video or link <span class="hint">(optional, e.g. unlisted YouTube link to the debate)</span></label><input id="f-media" type="text" value="${esc(q?.media_url ?? '')}"></div>
+      <div id="f-kind-fields"></div>
+      <label class="row" style="font-weight:500;margin-bottom:12px"><input type="checkbox" id="f-active" ${q?.active === false ? '' : 'checked'}> Active (included in the test)</label>
+      <div class="row"><button class="btn" type="submit">Save question</button><button class="btn btn-ghost" type="button" id="f-cancel">Cancel</button>
+        ${q ? '<button class="btn btn-danger btn-small" type="button" id="f-delete" style="margin-left:auto">Delete</button>' : ''}</div>
+    </form>`;
+    ($('#f-kind') as HTMLSelectElement).value = kind;
+    ($('#f-section') as HTMLSelectElement).value = q?.section ?? (kind === 'mcq' ? 'mcq' : kind === 'written' ? 'written' : 'debate');
+    const kindFields = () => {
+      const k = ($('#f-kind') as HTMLSelectElement).value;
+      const f = $('#f-kind-fields');
+      const same = q && q.kind === k;
+      if (k === 'mcq') {
+        f.innerHTML = `<div class="field"><label>Options <span class="hint">(one per line)</span></label><textarea id="f-opts" rows="5">${esc(same ? (q.options ?? []).join('\n') : '')}</textarea></div>
+          <div class="field"><label>Correct option number <span class="hint">(1 = first line)</span></label><input id="f-correct" type="number" min="1" value="${same ? (q.answer_key?.correct ?? 0) + 1 : 1}"></div>`;
+      } else if (k === 'call') {
+        const c = same ? q.answer_key?.correct : 'Proposition';
+        f.innerHTML = `<div class="field"><label>Correct call <span class="hint">(the CA panel's decision)</span></label><select id="f-call">
+          <option ${c === 'Proposition' ? 'selected' : ''}>Proposition</option><option ${c === 'Opposition' ? 'selected' : ''}>Opposition</option></select></div>`;
+      } else if (k === 'scores') {
+        const def = [['1st Proposition', 'Proposition', 60, 80], ['2nd Proposition', 'Proposition', 60, 80], ['3rd Proposition', 'Proposition', 60, 80], ['Proposition Reply', 'Proposition', 30, 40],
+          ['1st Opposition', 'Opposition', 60, 80], ['2nd Opposition', 'Opposition', 60, 80], ['3rd Opposition', 'Opposition', 60, 80], ['Opposition Reply', 'Opposition', 30, 40]];
+        const speakers = same ? (q.options ?? []).map((s: any, i: number) => [s.label, s.side ?? '', s.min, s.max, q.answer_key?.reference?.[i] ?? '']) : def.map((d) => [...d, '']);
+        f.innerHTML = `<div class="field"><label>Speakers and reference scores <span class="hint">(the CA panel's scores; a judge gets credit for each score within the tolerance)</span></label>
+          <div class="table-wrap"><table><thead><tr><th>Speaker</th><th>Side</th><th>Min</th><th>Max</th><th>Reference</th></tr></thead><tbody>
+          ${speakers.map((s: any) => `<tr data-sp><td><input type="text" value="${esc(s[0])}"></td><td><input type="text" value="${esc(s[1])}"></td>
+            <td><input type="number" value="${s[2]}" style="width:80px"></td><td><input type="number" value="${s[3]}" style="width:80px"></td>
+            <td><input type="number" step="0.5" value="${s[4]}" style="width:100px"></td></tr>`).join('')}
+          </tbody></table></div></div>
+          <div class="field" style="max-width:200px"><label>Tolerance (±)</label><input id="f-tol" type="number" step="0.5" min="0" value="${same ? q.answer_key?.tolerance ?? 1 : 1}"></div>`;
+      } else {
+        f.innerHTML = `<div class="field"><label>Marking rubric <span class="hint">(visible to markers only)</span></label><textarea id="f-rubric" rows="6">${esc(same ? q.rubric ?? '' : '')}</textarea></div>`;
+      }
+    };
+    kindFields();
+    $('#f-kind').onchange = kindFields;
+    $('#f-cancel').onclick = () => (box.innerHTML = '');
+    box.scrollIntoView({ behavior: 'smooth' });
+    const del = document.getElementById('f-delete');
+    if (del) del.onclick = async () => {
+      if (!confirm('Delete this question? Any answers judges gave to it are deleted too. Consider unticking "Active" instead.')) return;
+      const { error } = await supabase!.from('final_questions').delete().eq('id', q.id);
+      if (error) return toast(error.message, 'error');
+      toast('Deleted'); loaders.questions();
+    };
+    ($('#qf') as HTMLFormElement).onsubmit = async (e) => {
+      e.preventDefault();
+      const k = ($('#f-kind') as HTMLSelectElement).value;
+      const row: any = {
+        kind: k, section: ($('#f-section') as HTMLSelectElement).value,
+        position: Number(($('#f-pos') as HTMLInputElement).value) || 0,
+        points: Number(($('#f-pts') as HTMLInputElement).value) || 0,
+        prompt: ($('#f-prompt') as HTMLTextAreaElement).value.trim(),
+        media_url: ($('#f-media') as HTMLInputElement).value.trim() || null,
+        active: ($('#f-active') as HTMLInputElement).checked,
+        options: null, answer_key: null, rubric: null,
+      };
+      if (k === 'mcq') {
+        row.options = ($('#f-opts') as HTMLTextAreaElement).value.split('\n').map((s) => s.trim()).filter(Boolean);
+        const c = Number(($('#f-correct') as HTMLInputElement).value) - 1;
+        if (row.options.length < 2) return toast('Add at least two options', 'error');
+        if (c < 0 || c >= row.options.length) return toast('Correct option number is out of range', 'error');
+        row.answer_key = { correct: c };
+      } else if (k === 'call') {
+        row.options = ['Proposition', 'Opposition'];
+        row.answer_key = { correct: ($('#f-call') as HTMLSelectElement).value };
+      } else if (k === 'scores') {
+        const sp = [...document.querySelectorAll('[data-sp]')].map((tr) => [...tr.querySelectorAll('input')].map((i) => i.value.trim()));
+        const used = sp.filter((s) => s[0]);
+        if (used.some((s) => s[4] === '')) return toast('Enter a reference score for every speaker', 'error');
+        row.options = used.map((s) => ({ label: s[0], side: s[1] || null, min: Number(s[2]), max: Number(s[3]) }));
+        row.answer_key = { reference: used.map((s) => Number(s[4])), tolerance: Number(($('#f-tol') as HTMLInputElement).value) || 0 };
+      } else {
+        row.rubric = ($('#f-rubric') as HTMLTextAreaElement).value.trim() || null;
+      }
+      const { error } = q ? await supabase!.from('final_questions').update(row).eq('id', q.id) : await supabase!.from('final_questions').insert(row);
+      if (error) return toast(error.message, 'error');
+      toast('Question saved'); loaders.questions();
+    };
+  }
+
+  // ---------- Approved judges ----------
+  loaders.judges = async () => {
+    const el = panel('judges');
+    el.innerHTML = '<p class="muted">Loading…</p>';
+    const [{ data: list, error }, { data: profs }] = await Promise.all([
+      supabase!.from('final_allowlist').select('*').order('email'),
+      supabase!.from('profiles').select('email, verified_email, full_name, merged_into'),
+    ]);
+    if (error) { el.innerHTML = `<div class="notice notice-bad">${esc(error.message)}</div>`; return; }
+    const verified = new Map((profs ?? []).filter((p: any) => p.verified_email).map((p: any) => [p.verified_email, p.full_name]));
+    const guests = new Map((profs ?? []).filter((p: any) => !p.verified_email && !p.merged_into && p.email).map((p: any) => [p.email, p.full_name]));
+    const statusOf = (email: string) => verified.has(email) ? `<span class="badge badge-good">Signed in</span> ${esc(verified.get(email) || '')}`
+      : guests.has(email) ? `<span class="badge">Training as guest</span> ${esc(guests.get(email) || '')}` : '<span class="muted">not seen yet</span>';
+    el.innerHTML = `
+      <p class="muted">Only emails on this list can open the final test. Training modules are open to everyone who signs in.</p>
+      <form class="card" id="al-form">
+        <label for="al-emails">Add emails <span class="hint">(paste any list: one per line, or separated by commas or spaces)</span></label>
+        <textarea id="al-emails" rows="4" placeholder="judge1@example.com, judge2@example.com"></textarea>
+        <div class="field" style="margin-top:10px"><label for="al-note">Note <span class="hint">(optional, e.g. nation)</span></label><input id="al-note" type="text"></div>
+        <button class="btn" type="submit">Add to list</button>
+      </form>
+      <div class="row" style="justify-content:space-between;margin:16px 0 8px"><strong>${(list ?? []).length} approved</strong></div>
+      <div class="table-wrap"><table><thead><tr><th>Email</th><th>Status</th><th>Note</th><th></th></tr></thead><tbody>
+        ${(list ?? []).map((r: any) => `<tr><td>${esc(r.email)}</td><td>${statusOf(r.email)}</td>
+          <td>${esc(r.note ?? '')}</td><td><button class="btn btn-ghost btn-small" data-rm="${esc(r.email)}">Remove</button></td></tr>`).join('') || '<tr><td colspan="4" class="muted">Nobody yet.</td></tr>'}
+      </tbody></table></div>`;
+    ($('#al-form') as HTMLFormElement).onsubmit = async (e) => {
+      e.preventDefault();
+      const emails = [...new Set((($('#al-emails') as HTMLTextAreaElement).value.toLowerCase().match(/[^\s,;<>"]+@[^\s,;<>"]+\.[^\s,;<>"]+/g) ?? []))];
+      if (!emails.length) return toast('No email addresses found', 'error');
+      const note = ($('#al-note') as HTMLInputElement).value.trim() || null;
+      const { error: e2 } = await supabase!.from('final_allowlist').upsert(emails.map((email) => ({ email, note })), { onConflict: 'email' });
+      if (e2) return toast(e2.message, 'error');
+      toast(`Added ${emails.length} email(s)`); loaders.judges();
+    };
+    el.querySelectorAll<HTMLElement>('[data-rm]').forEach((b) => (b.onclick = async () => {
+      if (!confirm(`Remove ${b.dataset.rm}?`)) return;
+      const { error: e3 } = await supabase!.from('final_allowlist').delete().eq('email', b.dataset.rm!);
+      if (e3) return toast(e3.message, 'error');
+      loaders.judges();
+    }));
+  };
+
+  // ---------- Settings ----------
+  loaders.settings = async () => {
+    const el = panel('settings');
+    el.innerHTML = '<p class="muted">Loading…</p>';
+    const { data: s, error } = await supabase!.from('final_settings').select('*').eq('id', 1).single();
+    if (error) { el.innerHTML = `<div class="notice notice-bad">${esc(error.message)}</div>`; return; }
+    const local = (d: string | null) => {
+      if (!d) return '';
+      const t = new Date(d); t.setMinutes(t.getMinutes() - t.getTimezoneOffset());
+      return t.toISOString().slice(0, 16);
+    };
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    el.innerHTML = `<form class="card" id="st" style="max-width:640px">
+      <div class="field"><label>Test title</label><input id="s-title" type="text" value="${esc(s.title)}"></div>
+      <div class="field"><label>Instructions shown before the test starts</label><textarea id="s-instr" rows="5">${esc(s.instructions ?? '')}</textarea></div>
+      <div class="row">
+        <div class="field" style="flex:1;min-width:200px"><label>Opens <span class="hint">(${esc(tz)} time)</span></label><input id="s-open" type="datetime-local" value="${local(s.opens_at)}"></div>
+        <div class="field" style="flex:1;min-width:200px"><label>Closes <span class="hint">(${esc(tz)} time)</span></label><input id="s-close" type="datetime-local" value="${local(s.closes_at)}"></div>
+      </div>
+      <div class="field" style="max-width:200px"><label>Time limit (minutes)</label><input id="s-limit" type="number" min="1" value="${s.time_limit_minutes}"></div>
+      <label class="row" style="font-weight:500;margin-bottom:16px"><input type="checkbox" id="s-rel" ${s.results_released ? 'checked' : ''}> Results released (judges can see their own scores and marker comments)</label>
+      <button class="btn" type="submit">Save settings</button>
+    </form>`;
+    ($('#st') as HTMLFormElement).onsubmit = async (e) => {
+      e.preventDefault();
+      const toIso = (v: string) => (v ? new Date(v).toISOString() : null);
+      const rel = ($('#s-rel') as HTMLInputElement).checked;
+      if (rel && !s.results_released && !confirm('Release results to all judges now?')) return;
+      const { error: e2 } = await supabase!.from('final_settings').update({
+        title: ($('#s-title') as HTMLInputElement).value.trim() || 'Final Judge Test',
+        instructions: ($('#s-instr') as HTMLTextAreaElement).value.trim() || null,
+        opens_at: toIso(($('#s-open') as HTMLInputElement).value),
+        closes_at: toIso(($('#s-close') as HTMLInputElement).value),
+        time_limit_minutes: Number(($('#s-limit') as HTMLInputElement).value) || 90,
+        results_released: rel,
+      }).eq('id', 1);
+      if (e2) return toast(e2.message, 'error');
+      toast('Settings saved'); loaders.settings();
+    };
+  };
+</script>

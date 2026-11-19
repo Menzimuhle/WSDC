@@ -1,0 +1,87 @@
+---
+import Base from '../layouts/Base.astro';
+import TraineeGate from '../components/TraineeGate.astro';
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+---
+<Base title="Module">
+  <p class="small"><a href={base + 'modules/'}>← All modules</a></p>
+  <div id="head"><p class="muted">Loading…</p></div>
+  <TraineeGate />
+  <div class="gated">
+    <div id="draft-note"></div>
+    <div id="video"></div>
+    <article class="prose" id="body"></article>
+    <div id="quiz"></div>
+    <div class="card row" style="justify-content:space-between" id="complete-card">
+      <span id="complete-text">Finished this module? Mark it complete to record your progress.</span>
+      <button class="btn" id="complete-btn">Mark complete</button>
+    </div>
+    <nav class="row" style="justify-content:space-between;margin-top:24px" aria-label="Module navigation" id="pager"></nav>
+  </div>
+</Base>
+
+<script>
+  import { path, esc, toast, youtubeEmbed } from '../lib/supabase.js';
+  import { fetchModule, fetchModules, renderMarkdown, videoHtml } from '../lib/modules.js';
+  import { loadProgress, saveProgress } from '../lib/progress.js';
+  import { renderQuiz } from '../lib/quiz.js';
+
+  const slug = new URLSearchParams(location.search).get('m') || '';
+  const head = document.getElementById('head')!;
+  const btn = document.getElementById('complete-btn') as HTMLButtonElement;
+  const text = document.getElementById('complete-text')!;
+  let ready = false, loaded = false;
+
+  function setDone(when: string) {
+    text.textContent = `Completed on ${new Date(when).toLocaleDateString()}.`;
+    btn.textContent = 'Completed ✓';
+    btn.disabled = true;
+  }
+
+  async function onReady() {
+    if (!ready || !loaded) return;
+    const mine = (await loadProgress())[slug];
+    if (mine?.completed_at) setDone(mine.completed_at);
+    await saveProgress(slug, {}); // remember the visit for "continue where you left off"
+  }
+  document.addEventListener('trainee-ready', () => { ready = true; onReady(); });
+  if ((window as any).__traineeReady) ready = true;
+
+  (async () => {
+    let mod: any, all: any[] = [];
+    try {
+      [mod, all] = await Promise.all([fetchModule(slug), fetchModules({ includeDrafts: true })]);
+    } catch (e: any) {
+      head.innerHTML = `<div class="notice notice-bad">Could not load this module: ${esc(e.message)}</div>`; return;
+    }
+    if (!mod) { head.innerHTML = `<h1>Module not found</h1><p>It may have been moved or unpublished. <a href="${path('modules/')}">See all modules</a>.</p>`; document.querySelector('.gated')?.remove(); return; }
+
+    document.title = `${mod.title} · WSDC Judge Training`;
+    const order = all.filter((m) => m.published || m.slug === slug);
+    const idx = order.findIndex((m) => m.slug === slug);
+    head.innerHTML = `
+      <p class="muted small" style="margin:0">Module ${idx + 1}${mod.minutes ? ` · about ${mod.minutes} min` : ''}</p>
+      <h1>${esc(mod.title)}</h1>
+      ${mod.summary ? `<p class="muted">${esc(mod.summary)}</p>` : ''}`;
+    if (!mod.published) document.getElementById('draft-note')!.innerHTML = '<div class="notice notice-warn">Draft: only the CA team can see this module.</div>';
+    const embed = youtubeEmbed(mod.video_url);
+    if (embed) document.getElementById('video')!.innerHTML = videoHtml(embed, mod.title);
+    document.getElementById('body')!.innerHTML = renderMarkdown(mod.body);
+    renderQuiz(document.getElementById('quiz')!, slug, mod.quiz);
+
+    const prev = order[idx - 1], next = order[idx + 1];
+    document.getElementById('pager')!.innerHTML =
+      (prev ? `<a href="${path('module/?m=' + prev.slug)}">← ${esc(prev.title)}</a>` : '<span></span>') +
+      (next ? `<a href="${path('module/?m=' + next.slug)}">${esc(next.title)} →</a>` : '');
+
+    loaded = true;
+    onReady();
+  })();
+
+  btn.onclick = async () => {
+    const now = new Date().toISOString();
+    await saveProgress(slug, { completed_at: now });
+    setDone(now);
+    toast('Module marked complete');
+  };
+</script>

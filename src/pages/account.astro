@@ -1,0 +1,82 @@
+---
+import Base from '../layouts/Base.astro';
+const base = import.meta.env.BASE_URL.replace(/\/?$/, '/');
+---
+<Base title="Your details">
+  <div style="max-width:560px;margin:0 auto">
+    <h1>Your details</h1>
+    <div id="signed-out" class="notice" hidden>
+      You haven't started the training on this browser yet. <a href={base + 'modules/'}>Start training</a>, or <a href={base + 'login/'}>sign in with your email</a> if you trained on another device.
+    </div>
+    <form id="profile" class="card" hidden>
+      <div class="field"><label for="full_name">Full name</label><input id="full_name" type="text" required maxlength="120" /></div>
+      <div class="field"><label for="email">Email</label><input id="email" type="email" required /></div>
+      <div class="field"><label for="nation">Nation / affiliation</label><input id="nation" type="text" maxlength="80" placeholder="e.g. Kenya" /></div>
+      <button class="btn" type="submit">Save</button>
+    </form>
+
+    <div id="device" class="card" hidden>
+      <h2 style="margin-top:0">Continue on another device</h2>
+      <p class="muted">Your progress is saved to this browser's guest account. To pick up on another phone or computer, confirm your email once. After that you can sign in anywhere with an emailed link and your progress follows you.</p>
+      <button class="btn btn-ghost" id="link-email">Send confirmation link</button>
+      <div id="link-msg" class="notice" hidden></div>
+    </div>
+    <div id="verified" class="notice notice-good" hidden></div>
+
+    <p class="muted small" style="margin-top:16px">We store your name, email, nation, training progress and test answers. Only you and the WSDC CA team can see them.</p>
+  </div>
+</Base>
+<script>
+  import { supabase, path, toast } from '../lib/supabase.js';
+  (async () => {
+    if (!supabase) { document.getElementById('signed-out')!.hidden = false; return; }
+    const { data } = await supabase.auth.getSession();
+    const user = data.session?.user;
+    if (!user) { document.getElementById('signed-out')!.hidden = false; return; }
+
+    // Signed in with an emailed link? Bring in progress from guest accounts using the same email.
+    if (!user.is_anonymous) await supabase.rpc('merge_guest_training');
+
+    const { data: p } = await supabase.from('profiles').select('full_name, nation, email, verified_email, is_guest').eq('id', user.id).maybeSingle();
+    const form = document.getElementById('profile') as HTMLFormElement;
+    const nameEl = document.getElementById('full_name') as HTMLInputElement;
+    const emailEl = document.getElementById('email') as HTMLInputElement;
+    const nationEl = document.getElementById('nation') as HTMLInputElement;
+    form.hidden = false;
+    nameEl.value = p?.full_name ?? '';
+    emailEl.value = p?.email ?? user.email ?? '';
+    nationEl.value = p?.nation ?? '';
+    if (p?.verified_email) { emailEl.value = p.verified_email; emailEl.readOnly = true; }
+
+    if (p?.is_guest) {
+      document.getElementById('device')!.hidden = false;
+    } else if (p?.verified_email) {
+      const v = document.getElementById('verified')!;
+      v.hidden = false;
+      v.textContent = `Signed in as ${p.verified_email}. You can use this email to sign in on any device.`;
+    }
+
+    const firstTime = !p?.full_name;
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const patch: any = { full_name: nameEl.value.trim(), nation: nationEl.value.trim() || null };
+      if (!emailEl.readOnly) patch.email = emailEl.value.trim().toLowerCase();
+      const { error } = await supabase.from('profiles').update(patch).eq('id', user.id);
+      if (error) return toast(error.message, 'error');
+      toast('Saved');
+      if (firstTime) setTimeout(() => (location.href = path('modules/')), 600);
+    });
+
+    document.getElementById('link-email')?.addEventListener('click', async () => {
+      const email = emailEl.value.trim().toLowerCase();
+      const msg = document.getElementById('link-msg')!;
+      msg.hidden = false;
+      if (!email) { msg.className = 'notice notice-bad'; msg.textContent = 'Enter your email above first.'; return; }
+      await supabase.from('profiles').update({ email }).eq('id', user.id);
+      const { error } = await supabase.auth.updateUser({ email }, { emailRedirectTo: location.origin + path('account/') });
+      if (error) { msg.className = 'notice notice-bad'; msg.textContent = error.message; return; }
+      msg.className = 'notice notice-good';
+      msg.textContent = `We've sent a confirmation link to ${email}. Open it on this device to finish. After that, sign in anywhere with that email.`;
+    });
+  })();
+</script>
